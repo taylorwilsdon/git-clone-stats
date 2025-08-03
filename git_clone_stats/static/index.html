@@ -15,6 +15,32 @@
         </button>
     </div>
 
+    <!-- Authentication UI -->
+    <div id="auth-container" class="auth-container">
+        <div id="login-section" class="auth-section" style="display: none;">
+            <button id="login-btn" class="btn btn-primary login-btn">
+                <i class="fab fa-github"></i>
+                <span>Login with GitHub</span>
+            </button>
+        </div>
+        <div id="user-section" class="auth-section" style="display: none;">
+            <div class="user-info">
+                <img id="user-avatar" class="user-avatar" src="" alt="User Avatar" style="display: none;">
+                <span id="user-name" class="user-name"></span>
+                <button id="logout-btn" class="btn btn-secondary logout-btn">
+                    <i class="fas fa-sign-out-alt"></i>
+                    <span>Logout</span>
+                </button>
+            </div>
+        </div>
+        <div id="legacy-section" class="auth-section" style="display: none;">
+            <div class="legacy-auth-info">
+                <i class="fas fa-key"></i>
+                <span>Legacy Mode</span>
+            </div>
+        </div>
+    </div>
+
     <header class="hero">
         <div class="hero-content">
             <div class="hero-badge">

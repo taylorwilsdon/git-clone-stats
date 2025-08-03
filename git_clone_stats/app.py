@@ -44,13 +44,31 @@ class DatabaseManager:
         """Create the necessary tables if they don't exist."""
         try:
             with self.conn:
+                # Create users table for OAuth authentication
+                self.conn.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        github_id INTEGER UNIQUE NOT NULL,
+                        github_username TEXT NOT NULL,
+                        github_name TEXT,
+                        github_email TEXT,
+                        github_avatar_url TEXT,
+                        github_token TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        last_login TEXT NOT NULL
+                    )
+                """)
+                
+                # Create legacy tables (backward compatibility)
                 self.conn.execute("""
                     CREATE TABLE IF NOT EXISTS clone_history (
                         repo TEXT NOT NULL,
                         timestamp TEXT NOT NULL,
                         count INTEGER NOT NULL,
                         uniques INTEGER NOT NULL,
-                        PRIMARY KEY (repo, timestamp)
+                        user_id INTEGER,
+                        PRIMARY KEY (repo, timestamp, COALESCE(user_id, 0)),
+                        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
                     )
                 """)
                 self.conn.execute("""
@@ -59,37 +77,65 @@ class DatabaseManager:
                         timestamp TEXT NOT NULL,
                         count INTEGER NOT NULL,
                         uniques INTEGER NOT NULL,
-                        PRIMARY KEY (repo, timestamp)
+                        user_id INTEGER,
+                        PRIMARY KEY (repo, timestamp, COALESCE(user_id, 0)),
+                        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
                     )
                 """)
                 self.conn.execute("""
                     CREATE TABLE IF NOT EXISTS tracked_repos (
-                        repo_name TEXT PRIMARY KEY,
+                        repo_name TEXT NOT NULL,
                         added_at TEXT NOT NULL,
                         is_active INTEGER DEFAULT 1,
                         last_sync TEXT,
-                        owner_type TEXT DEFAULT 'user'
+                        owner_type TEXT DEFAULT 'user',
+                        user_id INTEGER,
+                        PRIMARY KEY (repo_name, COALESCE(user_id, 0)),
+                        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+                    )
+                """)
+                self.conn.execute("""
+                    CREATE TABLE IF NOT EXISTS repo_stars (
+                        repo TEXT NOT NULL,
+                        star_count INTEGER NOT NULL,
+                        last_updated TEXT NOT NULL,
+                        user_id INTEGER,
+                        PRIMARY KEY (repo, COALESCE(user_id, 0)),
+                        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
                     )
                 """)
                 
-                # Migration: Add owner_type column if it doesn't exist
-                try:
-                    self.conn.execute("ALTER TABLE tracked_repos ADD COLUMN owner_type TEXT DEFAULT 'user'")
-                    self.conn.commit()
-                except Exception:
-                    # Column already exists, ignore
-                    pass
-                self.conn.execute("""
-                    CREATE TABLE IF NOT EXISTS repo_stars (
-                        repo TEXT PRIMARY KEY,
-                        star_count INTEGER NOT NULL,
-                        last_updated TEXT NOT NULL
-                    )
-                """)
+                # Migration: Add user_id columns if they don't exist
+                self._migrate_to_multiuser()
+                
             self.logger.info("Database setup complete.")
         except sqlite3.Error as e:
             self.logger.error(f"Database setup failed: {e}")
             raise
+    
+    def _migrate_to_multiuser(self):
+        """Migrate existing single-user data to multi-user schema."""
+        try:
+            # Check if user_id columns already exist
+            cursor = self.conn.execute("PRAGMA table_info(clone_history)")
+            columns = [col[1] for col in cursor.fetchall()]
+            
+            if 'user_id' not in columns:
+                # Add user_id columns to existing tables
+                self.conn.execute("ALTER TABLE clone_history ADD COLUMN user_id INTEGER")
+                self.conn.execute("ALTER TABLE view_history ADD COLUMN user_id INTEGER") 
+                self.conn.execute("ALTER TABLE tracked_repos ADD COLUMN user_id INTEGER")
+                self.conn.execute("ALTER TABLE repo_stars ADD COLUMN user_id INTEGER")
+                
+                # Update primary keys to include user_id (SQLite doesn't support modifying constraints)
+                # The new CREATE TABLE statements handle this for new installs
+                
+                self.logger.info("Migrated database to multi-user schema")
+            
+        except sqlite3.Error as e:
+            # Migration already completed or failed - continue with existing schema
+            self.logger.debug(f"Migration note: {e}")
+            pass
 
     def _execute_query(self, query: str, params: tuple = (), fetch_all: bool = True):
         """Execute a database query with consistent error handling."""
@@ -375,6 +421,154 @@ class DatabaseManager:
 
         except (sqlite3.Error, KeyError, TypeError) as e:
             self.logger.error(f"Failed to import database: {e}")
+            return False
+
+    # User management methods for OAuth support
+    
+    def create_or_update_user(self, github_user_data: dict, github_token: str) -> int:
+        """Create or update a user record from GitHub OAuth data."""
+        try:
+            with self.conn:
+                # Check if user already exists
+                existing_user = self._execute_query(
+                    "SELECT id FROM users WHERE github_id = ?",
+                    (github_user_data['id'],),
+                    fetch_all=False
+                )
+                
+                current_time = datetime.now().isoformat()
+                
+                if existing_user:
+                    # Update existing user
+                    user_id = existing_user[0]
+                    self.conn.execute("""
+                        UPDATE users SET 
+                            github_username = ?, github_name = ?, github_email = ?,
+                            github_avatar_url = ?, github_token = ?, last_login = ?
+                        WHERE id = ?
+                    """, (
+                        github_user_data['login'],
+                        github_user_data.get('name'),
+                        github_user_data.get('email'),
+                        github_user_data.get('avatar_url'),
+                        github_token,
+                        current_time,
+                        user_id
+                    ))
+                else:
+                    # Create new user
+                    cursor = self.conn.execute("""
+                        INSERT INTO users (
+                            github_id, github_username, github_name, github_email,
+                            github_avatar_url, github_token, created_at, last_login
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        github_user_data['id'],
+                        github_user_data['login'],
+                        github_user_data.get('name'),
+                        github_user_data.get('email'),
+                        github_user_data.get('avatar_url'),
+                        github_token,
+                        current_time,
+                        current_time
+                    ))
+                    user_id = cursor.lastrowid
+                
+                self.logger.info(f"Created/updated user: {github_user_data['login']} (ID: {user_id})")
+                return user_id
+                
+        except sqlite3.Error as e:
+            self.logger.error(f"Failed to create/update user: {e}")
+            raise
+    
+    def get_user_by_github_id(self, github_id: int) -> Optional[dict]:
+        """Get user record by GitHub ID."""
+        row = self._execute_query(
+            "SELECT id, github_id, github_username, github_name, github_email, github_avatar_url, github_token FROM users WHERE github_id = ?",
+            (github_id,),
+            fetch_all=False
+        )
+        if row:
+            return {
+                'id': row[0],
+                'github_id': row[1],
+                'github_username': row[2],
+                'github_name': row[3],
+                'github_email': row[4],
+                'github_avatar_url': row[5],
+                'github_token': row[6]
+            }
+        return None
+    
+    def get_user_by_id(self, user_id: int) -> Optional[dict]:
+        """Get user record by internal user ID."""
+        row = self._execute_query(
+            "SELECT id, github_id, github_username, github_name, github_email, github_avatar_url, github_token FROM users WHERE id = ?",
+            (user_id,),
+            fetch_all=False
+        )
+        if row:
+            return {
+                'id': row[0],
+                'github_id': row[1],
+                'github_username': row[2],
+                'github_name': row[3],
+                'github_email': row[4],
+                'github_avatar_url': row[5],
+                'github_token': row[6]
+            }
+        return None
+
+    # Updated methods to support user context
+    
+    def get_tracked_repos(self, user_id: Optional[int] = None) -> List[Dict[str, str]]:
+        """Get tracked repositories for a specific user or legacy single-user."""
+        if user_id is not None:
+            # Multi-user mode: get repos for specific user
+            query = "SELECT repo_name, owner_type FROM tracked_repos WHERE is_active = 1 AND user_id = ?"
+            params = (user_id,)
+        else:
+            # Legacy mode: get repos with no user_id (backward compatibility)
+            query = "SELECT repo_name, owner_type FROM tracked_repos WHERE is_active = 1 AND user_id IS NULL"
+            params = ()
+            
+        rows = self._execute_query(query, params)
+        return [{"repo_name": row[0], "owner_type": row[1] if row[1] else "user"} for row in rows] if rows else []
+    
+    def add_tracked_repo(self, repo_name: str, owner_type: str = 'user', user_id: Optional[int] = None) -> bool:
+        """Add a repository to tracking with optional user context."""
+        try:
+            with self.conn:
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO tracked_repos (repo_name, added_at, is_active, owner_type, user_id) VALUES (?, ?, 1, ?, ?)",
+                    (repo_name, datetime.now().isoformat(), owner_type, user_id)
+                )
+            user_context = f" for user {user_id}" if user_id else " (legacy)"
+            self.logger.info(f"Added {repo_name} to tracked repos (owner_type: {owner_type}){user_context}.")
+            return True
+        except sqlite3.Error as e:
+            self.logger.error(f"Failed to add tracked repo {repo_name}: {e}")
+            return False
+
+    def remove_tracked_repo(self, repo_name: str, user_id: Optional[int] = None) -> bool:
+        """Remove a repository from tracking with optional user context."""
+        try:
+            with self.conn:
+                if user_id is not None:
+                    self.conn.execute(
+                        "UPDATE tracked_repos SET is_active = 0 WHERE repo_name = ? AND user_id = ?",
+                        (repo_name, user_id)
+                    )
+                else:
+                    self.conn.execute(
+                        "UPDATE tracked_repos SET is_active = 0 WHERE repo_name = ? AND user_id IS NULL",
+                        (repo_name,)
+                    )
+            user_context = f" for user {user_id}" if user_id else " (legacy)"
+            self.logger.info(f"Removed {repo_name} from tracked repos{user_context}.")
+            return True
+        except sqlite3.Error as e:
+            self.logger.error(f"Failed to remove tracked repo {repo_name}: {e}")
             return False
 
 
