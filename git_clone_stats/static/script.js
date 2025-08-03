@@ -25,6 +25,127 @@ themeToggle.addEventListener('click', () => {
     showToast('Theme updated!', 'success');
 });
 
+// Authentication Management
+let authStatus = {
+    authenticated: false,
+    oauth_configured: false,
+    user: null
+};
+
+async function checkAuthStatus() {
+    try {
+        const response = await fetch('/auth/status');
+        if (response.ok) {
+            authStatus = await response.json();
+            updateAuthUI();
+            return authStatus;
+        }
+    } catch (error) {
+        console.error('Auth status check failed:', error);
+    }
+    return null;
+}
+
+function updateAuthUI() {
+    const loginSection = document.getElementById('login-section');
+    const userSection = document.getElementById('user-section');
+    const legacySection = document.getElementById('legacy-section');
+    
+    // Hide all sections first
+    loginSection.style.display = 'none';
+    userSection.style.display = 'none';
+    legacySection.style.display = 'none';
+    
+    if (authStatus.oauth_configured) {
+        if (authStatus.authenticated && authStatus.user) {
+            // Show user info
+            userSection.style.display = 'block';
+            
+            const userName = document.getElementById('user-name');
+            const userAvatar = document.getElementById('user-avatar');
+            
+            userName.textContent = authStatus.user.name || authStatus.user.username;
+            
+            if (authStatus.user.avatar_url) {
+                userAvatar.src = authStatus.user.avatar_url;
+                userAvatar.style.display = 'block';
+            } else {
+                userAvatar.style.display = 'none';
+            }
+        } else {
+            // Show login button
+            loginSection.style.display = 'block';
+        }
+    } else {
+        // Legacy mode
+        if (authStatus.authenticated) {
+            legacySection.style.display = 'block';
+        } else {
+            // Show message about configuring OAuth or environment variables
+            showAuthRequiredOverlay();
+        }
+    }
+}
+
+function showAuthRequiredOverlay() {
+    const overlay = document.createElement('div');
+    overlay.className = 'auth-required-overlay';
+    overlay.innerHTML = `
+        <div class="auth-required-content">
+            <h2>Authentication Required</h2>
+            <p>Please configure GitHub OAuth credentials or set GITHUB_TOKEN and GITHUB_USERNAME environment variables to use this application.</p>
+            <button onclick="window.location.reload()" class="btn btn-primary">
+                <i class="fas fa-refresh"></i>
+                Refresh
+            </button>
+        </div>
+    `;
+    document.body.appendChild(overlay);
+}
+
+function initAuth() {
+    const loginBtn = document.getElementById('login-btn');
+    const logoutBtn = document.getElementById('logout-btn');
+    
+    if (loginBtn) {
+        loginBtn.addEventListener('click', () => {
+            window.location.href = '/auth/login';
+        });
+    }
+    
+    if (logoutBtn) {
+        logoutBtn.addEventListener('click', () => {
+            window.location.href = '/auth/logout';
+        });
+    }
+}
+
+// Enhanced API calls with authentication handling
+async function makeAuthenticatedRequest(url, options = {}) {
+    try {
+        const response = await fetch(url, options);
+        
+        if (response.status === 401) {
+            // Authentication required
+            if (authStatus.oauth_configured) {
+                showToast('Please login to continue', 'error');
+                setTimeout(() => {
+                    window.location.href = '/auth/login';
+                }, 1500);
+            } else {
+                showToast('Authentication required - please configure credentials', 'error');
+            }
+            return null;
+        }
+        
+        return response;
+    } catch (error) {
+        console.error('API request failed:', error);
+        showToast('Network error occurred', 'error');
+        return null;
+    }
+}
+
 // Toast Notifications
 function showToast(message, type = 'success') {
     const container = document.getElementById('toast-container');
@@ -446,7 +567,9 @@ const refreshChartBtn = document.getElementById('refresh-chart-btn');
 // API Helper Functions
 const api = {
     async get(url) {
-        const response = await fetch(url);
+        const response = await makeAuthenticatedRequest(url);
+        if (!response) return null;
+        
         if (!response.ok) {
             const error = await response.text();
             throw new Error(error || `Request failed: ${response.status}`);
@@ -455,11 +578,13 @@ const api = {
     },
 
     async post(url, data = {}) {
-        const response = await fetch(url, {
+        const response = await makeAuthenticatedRequest(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(data)
         });
+        if (!response) return null;
+        
         if (!response.ok) {
             const error = await response.text();
             throw new Error(error || `Request failed: ${response.status}`);
@@ -468,7 +593,9 @@ const api = {
     },
 
     async delete(url) {
-        const response = await fetch(url, { method: 'DELETE' });
+        const response = await makeAuthenticatedRequest(url, { method: 'DELETE' });
+        if (!response) return null;
+        
         if (!response.ok) {
             const error = await response.text();
             throw new Error(error || `Request failed: ${response.status}`);
@@ -1077,8 +1204,12 @@ document.addEventListener('keydown', (e) => {
 // Initialize
 document.addEventListener('DOMContentLoaded', async () => {
     initTheme();
+    initAuth();
+    await checkAuthStatus();
     await loadTemplate();
-    fetchStats();
+    if (authStatus.authenticated) {
+        fetchStats();
+    }
 });
 
 // Auto-refresh every 5 minutes
